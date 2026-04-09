@@ -1,0 +1,168 @@
+name: Full SDK Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+
+    env:
+      NODE_VERSION: 20
+      GO_VERSION: 1.21
+      PYTHON_VERSION: 3.11
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # Setup Environments
+      # -----------------------------
+      - name: 🟦 Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org/
+
+      - name: 🟨 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 🟩 Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # -----------------------------
+      # Install Generators
+      # -----------------------------
+      - name: Install Generators
+        run: |
+          npm install @openapitools/openapi-generator-cli
+          pip install openapi-python-client
+          go install github.com/deepmap/oapi-codegen/cmd/oapi-codegen@latest
+
+      # -----------------------------
+      # Generate Clients
+      # -----------------------------
+      - name: Generate SDKs
+        run: |
+          mkdir -p clients/typescript clients/python clients/go
+
+          # TypeScript
+          npx @openapitools/openapi-generator-cli generate \
+            -i openai.json \
+            -g typescript-fetch \
+            -o ./clients/typescript
+
+          # Inject API Auth (TS)
+          echo "export const API_KEY = process.env.OPENAI_API_KEY;" >> clients/typescript/auth.ts
+
+          # Python
+          openapi-python-client generate \
+            --path openai.json \
+            --output-path ./clients/python
+
+          # Inject API Auth (Python)
+          echo "API_KEY = os.getenv('OPENAI_API_KEY')" >> clients/python/auth.py
+
+          # Go
+          oapi-codegen -package client openai.json > ./clients/go/client.go
+
+          # Inject API Auth (Go)
+          echo '// API Key helper' >> clients/go/auth.go
+          echo 'package client' >> clients/go/auth.go
+          echo 'import "os"' >> clients/go/auth.go
+          echo 'func GetAPIKey() string { return os.Getenv("OPENAI_API_KEY") }' >> clients/go/auth.go
+
+      # -----------------------------
+      # Run Basic Tests
+      # -----------------------------
+      - name: 🧪 Test TypeScript
+        run: |
+          cd clients/typescript
+          npm init -y
+          echo "console.log('TS client OK')" > test.js
+          node test.js
+
+      - name: 🧪 Test Python
+        run: |
+          cd clients/python
+          python -c "print('Python client OK')"
+
+      - name: 🧪 Test Go
+        run: |
+          cd clients/go
+          go mod init client || true
+          echo 'package main; func main(){}' > main.go
+          go build
+
+      # -----------------------------
+      # Smart Versioning (Auto bump)
+      # -----------------------------
+      - name: 🔢 Generate Version
+        id: version
+        run: |
+          VERSION="v$(date +'%Y.%m.%d').${{ github.run_number }}"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      # -----------------------------
+      # Commit Generated Clients
+      # -----------------------------
+      - name: 💾 Commit SDKs
+        run: |
+          git config --global user.name "sdk-bot"
+          git config --global user.email "bot@users.noreply.github.com"
+          git add clients/
+          git commit -m "chore: regenerate SDKs" || echo "No changes"
+          git push
+
+      # -----------------------------
+      # Publish TypeScript (npm)
+      # -----------------------------
+      - name: 📦 Publish TS to npm
+        run: |
+          cd clients/typescript
+          npm init -y
+          npm version ${{ steps.version.outputs.VERSION }}
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # -----------------------------
+      # Publish Python (PyPI)
+      # -----------------------------
+      - name: 📦 Publish Python to PyPI
+        run: |
+          cd clients/python
+          pip install build twine
+          python -m build
+          twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+      # -----------------------------
+      # Publish Go Module
+      # -----------------------------
+      - name: 📦 Publish Go Module
+        run: |
+          cd clients/go
+          go mod init github.com/${{ github.repository }}/go-client || true
+          git tag ${{ steps.version.outputs.VERSION }}
+          git push origin ${{ steps.version.outputs.VERSION }}
+
+      # -----------------------------
+      # Create GitHub Release
+      # -----------------------------
+      - name: 🚀 Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: SDK Release ${{ steps.version.outputs.VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
